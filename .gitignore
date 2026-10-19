@@ -1,0 +1,19 @@
+# Godot
+.godot/
+export/
+*.translation
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local agent / editor files (never published)
+.claude/
+AGENTS.md
+CLAUDE.md
+
+# Local outputs and reference material
+captures/
+ref/
+__pycache__/
+*.pyc

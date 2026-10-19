@@ -1,0 +1,982 @@
+// BeachSandbox simulation kernels. One source, compiled once per kernel with
+// `#define KERNEL_<NAME>` (see scripts/sim/beach_sim.gd). Not named .glsl on
+// purpose so Godot does not import it as an RDShaderFile.
+//
+// Grids
+//   water grid  Nw x Nw, cell dxw : water_* = (w = B + h free surface, hu, hv, hs suspended sand)
+//                                   bed     = (B centre, B east face, B north face, max centre B in 3x3)
+//   sand grid   Ns x Ns, cell dxs : sand_*  = (height, wetness, strength, freshness)
+//   strength: 1 = wet-packed (a built wall), 0 = loose (poured / deposited / slumped).
+//   freshness: 1 = just moved (slid / scoured / dug / piled), decays over ~20 s (render only).
+//   fx grid     Nw x Nw            : fx_*    = (foam 0..1, previous-frame w, foam stranded on sand, aeration)
+//   Ns = 2 Nw. Water corners are the mean of the 2x2 sand cells around them, so
+//   B centre = 4x4 sand box mean and face values are the mean of their two corners.
+//
+// Water: Kurganov-Petrova 2007 central-upwind finite volume with the KP07
+// positivity / well-balancing correction, ported from REBOOT16 "Realistic
+// Shoreline Waves" (MIT, (c) 2026 Reboot16 / Enrico K.) and extended with a
+// dynamic bed, suspended sand and a sea boundary on the south edge.
+//
+// Units: metres, seconds. Grid y = world +Z (sea at j = 0, land at j = N-1).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+	ivec4 dims;      // Nw, Ns, frame, flags (1 sea, 2 infiltration, 4 erosion, 8 thermal)
+	vec4 sim;        // dt (substep), dxw, dxs, g
+	vec4 sea;        // time, tide level, relaxation cells, manning n
+	vec4 wave[4];    // amplitude, period, phase, angle (rad about +Z)
+	vec4 sea2;       // offshore depth, max speed, theta (minmod), kappa
+	vec4 ero;        // Kc, Ke loose, Ke packed, Kd
+	vec4 ero2;       // v crit, h cap, impact k, strength loss under flow (1/s per (m/s)^2)
+	vec4 wet;        // wet-in rate, dry rate, wicking of loose sand (cells^2/s), infiltration rate
+	vec4 wet2;       // water-table range, capillary rise rate, frame dt, max erosion per frame
+	vec4 th;         // tan dry, tan moist packed, tan saturated loose, wave ramp time
+	vec4 th2;        // noise amplitude, rate dry, rate moist, rate saturated
+	vec4 extra;      // soak weakening (1/s), wicking of packed sand (cells^2/s), foam source mask (debug), unused
+	vec4 fx;         // foam injection gain, foam life (s), stranded foam life (s), freshness life (s)
+	vec4 fx2;        // foam particles: spawn per cell per s at unit injection, life (s), stranded life (s), random walk (m/sqrt(s))
+} P;
+
+layout(set = 0, binding = 1, rgba32f) uniform restrict image2D water_src;
+layout(set = 0, binding = 2, rgba32f) uniform restrict image2D water_dst;
+layout(set = 0, binding = 3, rgba32f) uniform restrict image2D bed;
+layout(set = 0, binding = 4, rgba32f) uniform restrict image2D sand_a;
+layout(set = 0, binding = 5, rgba32f) uniform restrict image2D sand_b;
+layout(set = 0, binding = 6, rgba32f) uniform restrict image2D out1;
+layout(set = 0, binding = 7, rgba32f) uniform restrict image2D out2;
+layout(set = 0, binding = 8, r32f) uniform restrict image2D d_bed;
+layout(set = 0, binding = 9, std430) restrict buffer Sums { float sums[]; };
+layout(set = 0, binding = 10, rgba32f) uniform restrict image2D fx_src;
+layout(set = 0, binding = 11, rgba32f) uniform restrict image2D fx_dst;
+layout(set = 0, binding = 12, std430) restrict buffer Pick { float picks[]; };
+layout(set = 0, binding = 13, r16f) uniform restrict writeonly image2D foam_dots; // NF x NF splat (render only)
+layout(set = 0, binding = 14, std430) restrict buffer Parts { vec4 parts[]; };   // x, z (m), age, life (s); life 0 = dead
+layout(set = 0, binding = 15, std430) restrict buffer PartCtr { uint part_next[]; };
+// Caustic map (render only): ripple slope field, photon accumulator, resolved map.
+layout(set = 0, binding = 16, rgba16f) uniform restrict image2D caus_grad;  // NC^2: d eta/dx, d eta/dz
+layout(set = 0, binding = 17, std430) restrict buffer CausAcc { uint caus_acc[]; }; // 3 NC^2 fixed point
+layout(set = 0, binding = 18, rgba16f) uniform restrict image2D caus_map;   // NC^2: light density at 3 focal slices
+
+layout(push_constant, std430) uniform Push {
+	ivec4 pi; // kernel specific
+	vec4 pf;  // kernel specific
+} PC;
+
+#define NW (P.dims.x)
+#define NS (P.dims.y)
+#define DT (P.sim.x)
+#define DXW (P.sim.y)
+#define DXS (P.sim.z)
+#define G (P.sim.w)
+
+const float H_EPS = 1e-6;
+const float H_DRY = 1e-5;
+const float WET_H = 2e-3; // depth that counts as "covered by water" for sand and erosion
+
+ivec2 clampw(ivec2 c) { return clamp(c, ivec2(0), ivec2(NW - 1)); }
+ivec2 clamps(ivec2 c) { return clamp(c, ivec2(0), ivec2(NS - 1)); }
+
+// The outer 4 sand cells (under the 2 water ghost cells) mirror the interior so the
+// ghost bed matches its mirror image and the reflecting walls do not leak water.
+bool sand_interior(ivec2 s) { return all(greaterThanEqual(s, ivec2(4))) && all(lessThan(s, ivec2(NS - 4))); }
+ivec2 sand_mirror(ivec2 s) {
+	ivec2 m = s;
+	if (s.x < 4) m.x = 7 - s.x; else if (s.x >= NS - 4) m.x = 2 * NS - 9 - s.x;
+	if (s.y < 4) m.y = 7 - s.y; else if (s.y >= NS - 4) m.y = 2 * NS - 9 - s.y;
+	return m;
+}
+
+// Foam particles: ring buffer of NPART, splatted into an NF^2 image (NF = 4 Nw, 1 cm).
+#define NPART 262144u
+#define NF (4 * NW)
+
+uint pcg(uint v) {
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+float rand01(inout uint s) { s = pcg(s); return float(s) * (1.0 / 4294967296.0); }
+
+float hash12(vec2 p) {
+	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return fract((p3.x + p3.y) * p3.z);
+}
+
+float desing(float h, float hq, float k4) {
+	float h4 = h * h * h * h;
+	return 1.41421356237 * h * hq / sqrt(h4 + max(h4, k4));
+}
+
+float kappa4() { float k = P.sea2.w; return k * k * k * k; }
+
+// Depth and velocity of a water cell (reads water_src and bed).
+vec3 cell_huv(ivec2 c) {
+	c = clampw(c);
+	vec4 q = imageLoad(water_src, c);
+	vec4 b = imageLoad(bed, c);
+	float h = max(q.x - b.x, 0.0);
+	float k4 = pow(max(P.sea2.w, 1.5 * (b.w - b.x)), 4.0);
+	return vec3(h, desing(h, q.y, k4), desing(h, q.z, k4));
+}
+
+// Sand behaviour as a function of wetness w and strength s.
+float erodibility(float w, float s) {
+	float dry = 1.0 - smoothstep(0.05, 0.25, w);
+	float loose = 1.0 - s;
+	return (P.ero.z + (P.ero.y - P.ero.z) * loose * loose * loose) * (1.0 + 0.5 * dry);
+}
+
+// Loose sand: dry ~33 deg, damp ~37 deg, saturated flows (~15 deg).
+// Packed sand: needs moisture for cohesion, then stands near vertical (wet or saturated;
+// soaking lowers its strength over time instead). Blend by strength^2.
+float max_tan(float w, float s) {
+	float moist = smoothstep(0.06, 0.3, w);
+	float sat = smoothstep(0.82, 0.97, w);
+	float loose = mix(mix(P.th.x, 0.75, moist), P.th.z, sat);
+	float packed = mix(P.th.x, P.th.y, moist);
+	return mix(loose, packed, s * s);
+}
+
+float slump_rate(float w, float s) {
+	float sat = smoothstep(0.82, 0.97, w);
+	return mix(mix(P.th2.y, P.th2.w, sat), P.th2.z, s * s);
+}
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_STEP
+// Fused KP07 step: flux + bed source + Euler integrate + friction.
+// water_src -> water_dst. Ghost cells (2 wide) are copied and then rewritten
+// by KERNEL_BOUNDARY.
+
+float minmod3(float a, float b, float c) {
+	float mn = min(a, min(b, c));
+	float mx = max(a, max(b, c));
+	return mn > 0.0 ? mn : (mx < 0.0 ? mx : 0.0);
+}
+
+vec4 slope4(vec4 qm, vec4 q0, vec4 qp) {
+	float th = P.sea2.z;
+	return vec4(
+		minmod3(th * (q0.x - qm.x), 0.5 * (qp.x - qm.x), th * (qp.x - q0.x)),
+		minmod3(th * (q0.y - qm.y), 0.5 * (qp.y - qm.y), th * (qp.y - q0.y)),
+		minmod3(th * (q0.z - qm.z), 0.5 * (qp.z - qm.z), th * (qp.z - q0.z)),
+		minmod3(th * (q0.w - qm.w), 0.5 * (qp.w - qm.w), th * (qp.w - q0.w)));
+}
+
+vec2 correctedW(float w, float sw, float B_minus, float B_plus) {
+	float wp = w + 0.5 * sw;
+	float wm = w - 0.5 * sw;
+	if (wp < B_plus) {
+		wp = B_plus;
+		wm = 2.0 * w - B_plus;
+	}
+	if (wm < B_minus) {
+		wm = B_minus;
+		wp = 2.0 * w - B_minus;
+	}
+	return vec2(wm, wp);
+}
+
+vec4 faceFlux(float wL, vec4 qL, vec4 sL, float wR, vec4 qR, vec4 sR, float Bf, int axis, float k4) {
+	float hL = max(wL - Bf, 0.0);
+	float hR = max(wR - Bf, 0.0);
+	if (hL < H_EPS && hR < H_EPS) return vec4(0.0);
+	vec4 UL = qL + 0.5 * sL;
+	vec4 UR = qR - 0.5 * sR;
+	float uL = desing(hL, UL.y, k4);
+	float vL = desing(hL, UL.z, k4);
+	float cL = desing(hL, UL.w, k4);
+	float uR = desing(hR, UR.y, k4);
+	float vR = desing(hR, UR.z, k4);
+	float cR = desing(hR, UR.w, k4);
+	float nL = axis == 0 ? uL : vL;
+	float nR = axis == 0 ? uR : vR;
+	float aL = sqrt(G * hL);
+	float aR = sqrt(G * hR);
+	float ap = max(max(nL + aL, nR + aR), 0.0);
+	float am = min(min(nL - aL, nR - aR), 0.0);
+	float ad = ap - am;
+	if (ad < 1e-6) return vec4(0.0);
+	float qnL = hL * nL;
+	float qnR = hR * nR;
+	vec4 FL, FR;
+	if (axis == 0) {
+		FL = vec4(qnL, qnL * uL + 0.5 * G * hL * hL, qnL * vL, qnL * cL);
+		FR = vec4(qnR, qnR * uR + 0.5 * G * hR * hR, qnR * vR, qnR * cR);
+	} else {
+		FL = vec4(qnL, qnL * uL, qnL * vL + 0.5 * G * hL * hL, qnL * cL);
+		FR = vec4(qnR, qnR * uR, qnR * vR + 0.5 * G * hR * hR, qnR * cR);
+	}
+	vec4 jump = vec4(hR - hL, hR * uR - hL * uL, hR * vR - hL * vL, hR * cR - hL * cL);
+	return (ap * FL - am * FR + ap * am * jump) / ad;
+}
+
+vec4 Q(ivec2 id, int dx, int dy) { return imageLoad(water_src, id + ivec2(dx, dy)); }
+vec4 BT(ivec2 id, int dx, int dy) { return imageLoad(bed, id + ivec2(dx, dy)); }
+
+void main() {
+	ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+	int N = NW;
+	if (id.x >= N || id.y >= N) return;
+	if (id.x < 2 || id.x > N - 3 || id.y < 2 || id.y > N - 3) {
+		imageStore(water_dst, id, imageLoad(water_src, id));
+		return;
+	}
+	vec4 q_xmm = Q(id, -2, 0), q_xm = Q(id, -1, 0), q_0 = Q(id, 0, 0), q_xp = Q(id, 1, 0), q_xpp = Q(id, 2, 0);
+	vec4 q_ymm = Q(id, 0, -2), q_ym = Q(id, 0, -1), q_yp = Q(id, 0, 1), q_ypp = Q(id, 0, 2);
+
+	vec4 bot = BT(id, 0, 0);
+	vec4 bot_xm1 = BT(id, -1, 0), bot_xp1 = BT(id, 1, 0);
+	vec4 bot_ym1 = BT(id, 0, -1), bot_yp1 = BT(id, 0, 1);
+	float BE_xm2 = BT(id, -2, 0).y, BE_xm1 = bot_xm1.y, BE_0 = bot.y, BE_xp1 = bot_xp1.y;
+	float BN_ym2 = BT(id, 0, -2).z, BN_ym1 = bot_ym1.z, BN_0 = bot.z, BN_yp1 = bot_yp1.z;
+
+	float kap = P.sea2.w;
+	float k4_E = pow(max(kap, 1.5 * abs(bot_xp1.x - bot.x)), 4.0);
+	float k4_W = pow(max(kap, 1.5 * abs(bot.x - bot_xm1.x)), 4.0);
+	float k4_N = pow(max(kap, 1.5 * abs(bot_yp1.x - bot.x)), 4.0);
+	float k4_S = pow(max(kap, 1.5 * abs(bot.x - bot_ym1.x)), 4.0);
+
+	vec4 sxm = slope4(q_xmm, q_xm, q_0);
+	vec4 sx0 = slope4(q_xm, q_0, q_xp);
+	vec4 sxp = slope4(q_0, q_xp, q_xpp);
+	vec4 sym = slope4(q_ymm, q_ym, q_0);
+	vec4 sy0 = slope4(q_ym, q_0, q_yp);
+	vec4 syp = slope4(q_0, q_yp, q_ypp);
+
+	vec2 cw_xm = correctedW(q_xm.x, sxm.x, BE_xm2, BE_xm1);
+	vec2 cw_x0 = correctedW(q_0.x, sx0.x, BE_xm1, BE_0);
+	vec2 cw_xp = correctedW(q_xp.x, sxp.x, BE_0, BE_xp1);
+	vec2 cw_ym = correctedW(q_ym.x, sym.x, BN_ym2, BN_ym1);
+	vec2 cw_y0 = correctedW(q_0.x, sy0.x, BN_ym1, BN_0);
+	vec2 cw_yp = correctedW(q_yp.x, syp.x, BN_0, BN_yp1);
+
+	vec4 FE = faceFlux(cw_x0.y, q_0, sx0, cw_xp.x, q_xp, sxp, BE_0, 0, k4_E);
+	vec4 FW = faceFlux(cw_xm.y, q_xm, sxm, cw_x0.x, q_0, sx0, BE_xm1, 0, k4_W);
+	vec4 GN = faceFlux(cw_y0.y, q_0, sy0, cw_yp.x, q_yp, syp, BN_0, 1, k4_N);
+	vec4 GS = faceFlux(cw_ym.y, q_ym, sym, cw_y0.x, q_0, sy0, BN_ym1, 1, k4_S);
+
+	float hE = max(cw_x0.y - BE_0, 0.0);
+	float hW = max(cw_x0.x - BE_xm1, 0.0);
+	float hN = max(cw_y0.y - BN_0, 0.0);
+	float hS = max(cw_y0.x - BN_ym1, 0.0);
+	vec4 S = vec4(0.0,
+		-G * 0.5 * (hE + hW) * (BE_0 - BE_xm1) / DXW,
+		-G * 0.5 * (hN + hS) * (BN_0 - BN_ym1) / DXW,
+		0.0);
+	vec4 R = -(FE - FW) / DXW - (GN - GS) / DXW + S;
+
+	const float H_FRICTION = 3e-4;
+	float B = bot.x;
+	float k4c = pow(max(kap, 1.5 * (bot.w - bot.x)), 4.0);
+	float h0 = max(q_0.x - B, 0.0);
+	float u0 = desing(h0, q_0.y, k4c);
+	float v0 = desing(h0, q_0.z, k4c);
+	float speed0 = length(vec2(u0, v0));
+	float n = P.sea.w;
+	float fric = h0 > H_FRICTION ? G * n * n * speed0 / pow(max(h0, H_FRICTION), 4.0 / 3.0) : 0.0;
+	vec4 qn;
+	qn.x = q_0.x + DT * R.x;
+	qn.y = (q_0.y + DT * R.y) / (1.0 + DT * fric);
+	qn.z = (q_0.z + DT * R.z) / (1.0 + DT * fric);
+	qn.w = max(q_0.w + DT * R.w, 0.0);
+	float hn = qn.x - B;
+	if (hn < H_DRY) {
+		// Snap to dry. The suspended sand left behind settles on the bed in KERNEL_EROSION.
+		imageStore(water_dst, id, vec4(B + max(hn, 0.0), 0.0, 0.0, qn.w));
+		return;
+	}
+	float un = desing(hn, qn.y, k4c);
+	float vn = desing(hn, qn.z, k4c);
+	float sp = length(vec2(un, vn));
+	float vmax = P.sea2.y;
+	if (sp > vmax) {
+		float sc = vmax / sp;
+		qn.y = hn * un * sc;
+		qn.z = hn * vn * sc;
+	}
+	imageStore(water_dst, id, qn);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_BOUNDARY
+// In place on water_dst after KERNEL_STEP. South edge: wavemaker ghosts plus a
+// relaxation zone toward the analytic incident sea (also absorbs reflections).
+// Other edges: mirror walls. Ghost threads only read interior cells.
+// PC.pf.x: simulation time of this substep.
+
+vec3 wave_component(vec2 p, vec4 wv) {
+	float A = wv.x;
+	if (A == 0.0) return vec3(0.0);
+	float omega = 6.28318530718 / wv.y;
+	float d0 = P.sea2.x;
+	float kwn = omega * omega / (G * sqrt(tanh(omega * omega * d0 / G))); // Eckart
+	vec2 dir = vec2(sin(wv.w), cos(wv.w)); // angle about +Z (grid +y)
+	float e = A * sin(omega * PC.pf.x - kwn * dot(dir, p) + wv.z);
+	return vec3(e, (omega / kwn) * e * dir.x, (omega / kwn) * e * dir.y);
+}
+
+vec3 incident(vec2 p) {
+	vec3 s = wave_component(p, P.wave[0]) + wave_component(p, P.wave[1])
+		+ wave_component(p, P.wave[2]) + wave_component(p, P.wave[3]);
+	float ramp = clamp(PC.pf.x / max(P.th.w, 1e-3), 0.0, 1.0);
+	return s * ramp;
+}
+
+void main() {
+	ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+	int N = NW;
+	if (id.x >= N || id.y >= N) return;
+	bool sea_on = (P.dims.w & 1) != 0;
+	bool gw = id.x < 2, ge = id.x > N - 3, gs = id.y < 2, gn = id.y > N - 3;
+	vec2 p = (vec2(id) + 0.5) * DXW;
+	float B = imageLoad(bed, id).x;
+
+	if (gs && sea_on && !gw && !ge) {
+		vec3 inc = incident(p);
+		imageStore(water_dst, id, vec4(max(P.sea.y + inc.x, B), inc.y, inc.z, 0.0));
+		return;
+	}
+	if (!(gw || ge || gs || gn)) {
+		int relax = int(P.sea.z);
+		if (!sea_on || id.y >= 2 + relax) return;
+		vec4 q = imageLoad(water_dst, id);
+		float wgt = 1.0 - float(id.y - 2) / float(relax);
+		float alpha = 0.06 * wgt * wgt;
+		vec3 inc = incident(p);
+		q.x = mix(q.x, max(P.sea.y + inc.x, B), alpha);
+		q.y = mix(q.y, inc.y, alpha);
+		q.z = mix(q.z, inc.z, alpha);
+		q.w *= 1.0 - alpha;
+		imageStore(water_dst, id, q);
+		return;
+	}
+	ivec2 src = id;
+	vec4 flip = vec4(1.0);
+	if (gw) { src.x = 3 - id.x; flip.y = -1.0; }
+	else if (ge) { src.x = 2 * N - 5 - id.x; flip.y = -1.0; }
+	if (gs) { src.y = 3 - id.y; flip.z = -1.0; }
+	else if (gn) { src.y = 2 * N - 5 - id.y; flip.z = -1.0; }
+	if (gs && sea_on) src.y = 2; // corner ghosts next to the wavemaker: copy the first interior row
+	vec4 q = imageLoad(water_dst, src);
+	float B_src = imageLoad(bed, src).x;
+	float h = max(q.x - B_src, 0.0);
+	imageStore(water_dst, id, vec4(B + h, q.y * flip.y, q.z * flip.z, q.w));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_EROSION
+// Once per frame: sediment pick-up / settling, wave impact on dry sand faces,
+// infiltration. water_src -> water_dst, writes d_bed (bed change in m).
+
+vec2 sand_ws(ivec2 c) { // mean (wetness, strength) of the 2x2 sand cells under water cell c
+	ivec2 s = clampw(c) * 2;
+	return 0.25 * (imageLoad(sand_a, s).yz + imageLoad(sand_a, s + ivec2(1, 0)).yz
+		+ imageLoad(sand_a, s + ivec2(0, 1)).yz + imageLoad(sand_a, s + ivec2(1, 1)).yz);
+}
+
+float sand_erodibility(ivec2 c) { vec2 ws = sand_ws(c); return erodibility(ws.x, ws.y); }
+
+// Sand knocked off dry cell `d` by water in wet cell `a` moving towards it.
+// Computed identically from both sides so the transfer is conservative.
+float impact(ivec2 a, ivec2 d, vec2 dir) {
+	vec3 ha = cell_huv(a);
+	vec3 hd = cell_huv(d);
+	if (ha.x < 0.01 || hd.x > WET_H) return 0.0;
+	float step_h = imageLoad(bed, d).x - imageLoad(bed, a).x;
+	if (step_h <= 0.005) return 0.0;
+	float un = max(dot(ha.yz, dir), 0.0);
+	float e = P.ero2.z * sand_erodibility(d) * min(ha.x, 0.3) * un * un * P.wet2.z;
+	return min(e, min(step_h * 0.25, P.wet2.w));
+}
+
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x >= NW || c.y >= NW) return;
+	vec4 q = imageLoad(water_src, c);
+	float B = imageLoad(bed, c).x;
+	vec3 huv = cell_huv(c);
+	float h = huv.x;
+	float fdt = P.wet2.z;
+	float dbed = 0.0;
+	float sed = q.w;
+	bool interior = c.x >= 2 && c.y >= 2 && c.x < NW - 2 && c.y < NW - 2;
+	if ((P.dims.w & 4) != 0 && interior) {
+		float ke = sand_erodibility(c);
+		if (h > WET_H) {
+			float speed = length(huv.yz);
+			float ex = max(speed - P.ero2.x, 0.0);
+			float cap = P.ero.x * min(h, P.ero2.y) * ex * ex;
+			if (sed < cap) {
+				float e = min(ke * (cap - sed) * fdt, P.wet2.w);
+				sed += e;
+				dbed -= e;
+			} else {
+				float d = min(P.ero.w * fdt, 1.0) * (sed - cap);
+				sed -= d;
+				dbed += d;
+			}
+		} else {
+			dbed += sed; // water (nearly) gone: everything settles
+			sed = 0.0;
+		}
+		ivec2 dirs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+		for (int k = 0; k < 4; k++) {
+			ivec2 nb = c + dirs[k];
+			if (nb.x < 2 || nb.y < 2 || nb.x >= NW - 2 || nb.y >= NW - 2) continue;
+			sed += impact(c, nb, vec2(dirs[k]));   // I am the wet cell
+			dbed -= impact(nb, c, -vec2(dirs[k])); // I am the dry wall cell
+		}
+	}
+	float w = q.x;
+	if ((P.dims.w & 2) != 0 && h > 0.0 && interior) {
+		float inf = min(h, P.wet.w * max(1.0 - sand_ws(c).x, 0.0) * fdt);
+		w -= inf;
+	}
+	imageStore(water_dst, c, vec4(w, q.y, q.z, sed));
+	imageStore(d_bed, c, vec4(dbed));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_SAND_APPLY
+// sand_a -> sand_b: add the bed change (conservative 2x upsampling with
+// [1 3 3 1]/4 weights), update wetness from water, water table and wicking.
+
+float dbed_at(ivec2 c) { return imageLoad(d_bed, clampw(c)).x; }
+
+void main() {
+	ivec2 s = ivec2(gl_GlobalInvocationID.xy);
+	if (s.x >= NS || s.y >= NS) return;
+	if (!sand_interior(s)) {
+		imageStore(sand_b, s, imageLoad(sand_a, sand_mirror(s)));
+		return;
+	}
+	vec4 sd = imageLoad(sand_a, s);
+	ivec2 p = s / 2;
+	ivec2 o = ivec2(s.x % 2 == 0 ? -1 : 1, s.y % 2 == 0 ? -1 : 1);
+	float db = (9.0 * dbed_at(p) + 3.0 * dbed_at(p + ivec2(o.x, 0)) + 3.0 * dbed_at(p + ivec2(0, o.y))
+		+ dbed_at(p + o)) / 16.0;
+	float height = sd.x + db;
+
+	float fdt = P.wet2.z;
+	float w = sd.y;
+	float h = cell_huv(p).x;
+	if (h > WET_H) {
+		w = min(1.0, w + P.wet.x * fdt);
+	} else {
+		// Capillary rise from the water table: sand just above the sea stays damp.
+		float above = height - P.sea.y;
+		float env = clamp(1.0 - above / P.wet2.x, 0.0, 1.0) * 0.9;
+		if (w > env) w = max(env, w - P.wet.y * fdt);
+		else w = min(env, w + P.wet2.y * fdt);
+	}
+	// Lateral wicking: loose (dry-poured) sand soaks up water much faster than packed sand.
+	float dself = mix(P.wet.z, P.extra.y, sd.z);
+	float flux = 0.0;
+	ivec2 wn[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+	for (int k = 0; k < 4; k++) {
+		vec4 sn = imageLoad(sand_a, clamps(s + wn[k]));
+		float dn = mix(P.wet.z, P.extra.y, sn.z);
+		flux += min(0.5 * (dself + dn) * fdt, 0.2) * (sn.y - sd.y);
+	}
+	w = clamp(w + flux, 0.0, 1.0);
+
+	// Strength: settled sediment is loose; flowing water wears packed sand down
+	// (cells under the flow and dry faces hit by it); calm water re-compacts the bed.
+	float st = sd.z;
+	// One strength per column: a thin loose layer only nudges it (~5 cm replaces it).
+	if (db > 0.0) st = mix(st, 0.0, clamp(db / 0.05, 0.0, 1.0));
+	float attack = 0.0;
+	vec3 huv = cell_huv(p);
+	// Local sand slope: flow only unpacks steep faces, not the flat beach bed.
+	float gx = imageLoad(sand_a, clamps(s + ivec2(1, 0))).x - imageLoad(sand_a, clamps(s - ivec2(1, 0))).x;
+	float gz = imageLoad(sand_a, clamps(s + ivec2(0, 1))).x - imageLoad(sand_a, clamps(s - ivec2(0, 1))).x;
+	float steep = smoothstep(0.25, 0.9, length(vec2(gx, gz)) / (2.0 * DXS));
+	if (huv.x > WET_H) {
+		float sp = min(length(huv.yz), 1.5);
+		attack = sp * sp * min(huv.x / 0.03, 1.0) * steep;
+		if (sp < 0.25 && st < 0.9) st += (0.9 - st) * 0.05 * fdt; // calm water re-compacts the bed
+	} else {
+		ivec2 nbs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+		for (int k = 0; k < 4; k++) {
+			vec3 hn = cell_huv(p + nbs[k]);
+			float toward = min(max(-dot(hn.yz, vec2(nbs[k])), 0.0), 1.5);
+			attack = max(attack, toward * toward * min(hn.x / 0.03, 1.0));
+		}
+		// Soaked through above the water line: capillary bridges flood, cohesion goes.
+		st -= P.extra.x * clamp((w - 0.9) / 0.1, 0.0, 1.0) * fdt;
+	}
+	st = clamp(st - P.ero2.w * attack * fdt, 0.0, 1.0);
+	// Freshness (render only): scour or deposition faster than ~6 mm/s shows as fresh sand.
+	float fresh = sd.w * exp(-fdt / P.fx.w);
+	fresh = max(fresh, clamp((abs(db) / max(fdt, 1e-4) - 0.006) / 0.02, 0.0, 1.0));
+	imageStore(sand_b, s, vec4(height, w, st, fresh));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_THERMAL_OUT) || defined(KERNEL_THERMAL_IN)
+const ivec2 NB[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
+	ivec2(1, 1), ivec2(-1, -1), ivec2(-1, 1), ivec2(1, -1));
+// NB[k] and NB[k ^ 1] are opposite directions.
+// PC.pi.z: 0 = read sand_b, write sand_a; 1 = read sand_a, write sand_b.
+vec4 sand_src(ivec2 c) { return PC.pi.z == 0 ? imageLoad(sand_b, c) : imageLoad(sand_a, c); }
+#endif
+
+#ifdef KERNEL_THERMAL_OUT
+// Slope slumping: sand steeper than the wetness-dependent angle of repose
+// flows downhill. Per-cell random jitter of the angle breaks up grid artefacts
+// (and gives the slopes a grainy look).
+
+void main() {
+	ivec2 s = ivec2(gl_GlobalInvocationID.xy);
+	if (s.x >= NS || s.y >= NS) return;
+	vec4 sd = sand_src(s);
+	if ((P.dims.w & 8) == 0 || !sand_interior(s)) {
+		imageStore(out1, s, vec4(0.0));
+		imageStore(out2, s, vec4(0.0));
+		return;
+	}
+	float jitter = 1.0 + P.th2.x * (2.0 * hash12(vec2(s) + float(P.dims.z % 4096) * 17.13) - 1.0);
+	float tn = max_tan(sd.y, sd.z) * jitter;
+	float ex[8];
+	float mx = 0.0;
+	float sum = 0.0;
+	for (int k = 0; k < 8; k++) {
+		ivec2 nb = s + NB[k];
+		ex[k] = 0.0;
+		if (!sand_interior(nb)) continue;
+		float dist = k < 4 ? DXS : DXS * 1.41421356;
+		float e = sd.x - sand_src(nb).x - tn * dist;
+		if (e > 0.0) {
+			ex[k] = e;
+			sum += e;
+			mx = max(mx, e);
+		}
+	}
+	float move = sum > 0.0 ? min(slump_rate(sd.y, sd.z) * P.wet2.z, 1.0) * 0.5 * mx / sum : 0.0;
+	imageStore(out1, s, vec4(ex[0], ex[1], ex[2], ex[3]) * move);
+	imageStore(out2, s, vec4(ex[4], ex[5], ex[6], ex[7]) * move);
+}
+#endif
+
+#ifdef KERNEL_THERMAL_IN
+// Outflow of cell c towards direction k (no dynamic vector indexing: Godot rejects OpVectorExtractDynamic).
+float pick(vec4 v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
+float outflow(ivec2 c, int k) {
+	return k < 4 ? pick(imageLoad(out1, c), k) : pick(imageLoad(out2, c), k - 4);
+}
+
+void main() {
+	ivec2 s = ivec2(gl_GlobalInvocationID.xy);
+	if (s.x >= NS || s.y >= NS) return;
+	vec4 sd = sand_src(s);
+	vec4 o1 = imageLoad(out1, s);
+	vec4 o2 = imageLoad(out2, s);
+	float h = sd.x - (o1.x + o1.y + o1.z + o1.w + o2.x + o2.y + o2.z + o2.w);
+	float in_amt = 0.0;
+	float in_w = 0.0;
+	float in_s = 0.0;
+	for (int k = 0; k < 8; k++) {
+		ivec2 nb = s + NB[k];
+		if (!sand_interior(nb) || !sand_interior(s)) continue;
+		float a = outflow(nb, k ^ 1);
+		in_amt += a;
+		vec4 sn = sand_src(nb);
+		in_w += a * sn.y;
+		in_s += a * sn.z;
+	}
+	h += in_amt;
+	float w = sd.y;
+	float st = sd.z;
+	float lost = sd.x - h + in_amt;
+	float fresh = max(sd.w, clamp((max(in_amt, lost) - 2e-5) / 3e-4, 0.0, 1.0));
+	if (in_amt > 0.0) {
+		// Arriving sand covers the surface; ~1 cm of it fully replaces the surface
+		// wetness. Sand that slid is loosened; ~5 cm of it replaces the column strength.
+		w = mix(w, in_w / in_amt, clamp(in_amt / 0.01, 0.0, 1.0));
+		st = mix(st, 0.4 * in_s / in_amt, clamp(in_amt / 0.05, 0.0, 1.0));
+	}
+	if (PC.pi.z == 0) imageStore(sand_a, s, vec4(h, w, st, fresh));
+	else imageStore(sand_b, s, vec4(h, w, st, fresh));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_BED
+// water_src -> water_dst and bed (in place, own texel): rebuild the bed from
+// sand_a and shift the free surface so the water depth is unchanged.
+
+float corner(ivec2 k) { // corner k of the water grid = between sand cells 2k-1 and 2k
+	ivec2 s = k * 2;
+	return 0.25 * (imageLoad(sand_a, clamps(s - ivec2(1, 1))).x + imageLoad(sand_a, clamps(s - ivec2(0, 1))).x
+		+ imageLoad(sand_a, clamps(s - ivec2(1, 0))).x + imageLoad(sand_a, clamps(s)).x);
+}
+
+float centre(ivec2 c) {
+	c = clampw(c);
+	return 0.25 * (corner(c) + corner(c + ivec2(1, 0)) + corner(c + ivec2(0, 1)) + corner(c + ivec2(1, 1)));
+}
+
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x >= NW || c.y >= NW) return;
+	vec4 q = imageLoad(water_src, c);
+	vec4 old_b = imageLoad(bed, c);
+	float c00 = corner(c), c10 = corner(c + ivec2(1, 0)), c01 = corner(c + ivec2(0, 1)), c11 = corner(c + ivec2(1, 1));
+	float bc = 0.25 * (c00 + c10 + c01 + c11);
+	float be = 0.5 * (c10 + c11);
+	float bn = 0.5 * (c01 + c11);
+	float bmax = bc;
+	for (int y = -1; y <= 1; y++)
+		for (int x = -1; x <= 1; x++)
+			if (x != 0 || y != 0) bmax = max(bmax, centre(c + ivec2(x, y)));
+	float h = max(q.x - old_b.x, 0.0);
+	if (PC.pi.x == 1) { // initialise: still water at level PC.pf.x, only seaward of z = PC.pf.y
+		h = (float(c.y) + 0.5) * DXW < PC.pf.y ? max(PC.pf.x - bc, 0.0) : 0.0;
+		q = vec4(0.0);
+	}
+	imageStore(water_dst, c, vec4(bc + h, q.y, q.z, q.w));
+	imageStore(bed, c, vec4(bc, be, bn, bmax));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_BRUSH
+// In place on sand_a. pi.x: mode (0 dig, 1 pile, 2 stamp), pi.y: wetness * 1000, pi.z: strength * 1000 of added sand.
+// pf: centre xz (m), radius (m), height change this frame at the centre (m).
+// Stamp (bucket mould / wall segment): pf.w is the absolute top height; the sand is raised
+// to a frustum with a flat top over pi.w / 1000 of the radius (no-op where already higher).
+void main() {
+	ivec2 s = ivec2(gl_GlobalInvocationID.xy);
+	if (s.x >= NS || s.y >= NS || !sand_interior(s)) return;
+	vec2 p = (vec2(s) + 0.5) * DXS;
+	float r = length(p - PC.pf.xy) / PC.pf.z;
+	if (r >= 1.0) return;
+	if (PC.pi.x == 2) {
+		vec4 st = imageLoad(sand_a, s);
+		float top = float(PC.pi.w) / 1000.0;
+		float prof = 1.0 - clamp((r - top) / max(1.0 - top, 1e-3), 0.0, 1.0);
+		float target = mix(st.x, PC.pf.w, prof);
+		if (target > st.x + 1e-4) {
+			st.x = target;
+			st.y = float(PC.pi.y) / 1000.0;
+			st.z = float(PC.pi.z) / 1000.0;
+			st.w = 1.0;
+			imageStore(sand_a, s, st);
+		}
+		return;
+	}
+	float fall = 1.0 - smoothstep(0.0, 1.0, r);
+	vec4 sd = imageLoad(sand_a, s);
+	float amt = PC.pf.w * fall;
+	sd.w = max(sd.w, smoothstep(0.0, 0.5, 1.0 - r));
+	if (PC.pi.x == 0) {
+		sd.x -= amt;
+	} else {
+		sd.x += amt;
+		float f = clamp(amt / 0.01, 0.0, 1.0);
+		sd.y = mix(sd.y, float(PC.pi.y) / 1000.0, f);
+		sd.z = mix(sd.z, float(PC.pi.z) / 1000.0, f);
+	}
+	imageStore(sand_a, s, sd);
+}
+#endif
+
+#ifdef KERNEL_POUR
+// Add water in place on water_src (bucket). pf: centre xz, radius, depth added this frame.
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x < 2 || c.y < 2 || c.x >= NW - 2 || c.y >= NW - 2) return;
+	vec2 p = (vec2(c) + 0.5) * DXW;
+	float r = length(p - PC.pf.xy) / PC.pf.z;
+	if (r >= 1.0) return;
+	vec4 q = imageLoad(water_src, c);
+	q.x += PC.pf.w * (1.0 - r * r);
+	imageStore(water_src, c, q);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_FX
+// Once per frame after the water substeps (render-only fields): fx_src -> fx_dst.
+// Foam is a per-area concentration advected semi-Lagrangian with the flow and fed by
+// breaking (fast rise of the surface relative to the wave celerity), bores (Fr > 1),
+// thin fast swash and water running into steps; it decays with life P.fx.y. When a
+// cell dries its foam is left on the sand as "stranded" lace that fades (P.fx.z).
+// Same idea as REBOOT16 RSW's foam sources, but kept out of the conserved state.
+
+vec4 fx_bilinear(vec2 p) { // p in cell units, cell centres at i + 0.5
+	vec2 f = p - 0.5;
+	ivec2 i0 = ivec2(floor(f));
+	vec2 t = f - vec2(i0);
+	vec4 a = imageLoad(fx_src, clampw(i0)), b = imageLoad(fx_src, clampw(i0 + ivec2(1, 0)));
+	vec4 c = imageLoad(fx_src, clampw(i0 + ivec2(0, 1))), d = imageLoad(fx_src, clampw(i0 + ivec2(1, 1)));
+	return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x >= NW || c.y >= NW) return;
+	float fdt = P.wet2.z;
+	vec4 prev = imageLoad(fx_src, c);
+	vec4 q = imageLoad(water_src, c);
+	vec3 huv = cell_huv(c);
+	float h = huv.x;
+	vec2 vel = huv.yz;
+	float foam = 0.0;
+	float aer = 0.0;
+	float stranded = prev.b * exp(-fdt / P.fx.z);
+	bool interior = c.x >= 2 && c.y >= 2 && c.x < NW - 2 && c.y < NW - 2;
+	if (h > WET_H && interior) {
+		vec4 adv = fx_bilinear(vec2(c) + 0.5 - vel * fdt / DXW);
+		foam = adv.r * exp(-fdt / P.fx.y);
+		aer = adv.a * exp(-fdt / 0.5);
+		float B = imageLoad(bed, c).x;
+		float c0 = sqrt(G * max(h, 1e-3));
+		float detadt = (q.x - prev.g) / max(fdt, 1e-4);
+		float brk = smoothstep(0.2 * c0, 0.5 * c0, detadt) * smoothstep(0.01, 0.04, h);
+		float sp = length(vel);
+		float bore = smoothstep(1.1, 1.6, sp / c0) * smoothstep(0.02, 0.05, h);
+		// Swash front: cells that were dry last frame and are now flooded by moving water
+		// (the tips of run-up tongues), not the whole thin sheet behind them.
+		float prev_h = prev.g - B;
+		float swash = (prev_h < WET_H ? 1.0 : 0.0) * smoothstep(0.25, 0.8, sp) / max(fdt * P.fx.x, 1e-3) * 0.3;
+		float hit = 0.0;
+		ivec2 dirs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+		for (int k = 0; k < 4; k++) {
+			float step_h = imageLoad(bed, clampw(c + dirs[k])).x - B;
+			hit = max(hit, max(dot(vel, vec2(dirs[k])) - 0.2, 0.0) * smoothstep(0.03, 0.08, step_h));
+		}
+		// No foam from the artificial relaxation zone next to the wavemaker.
+		float relax = (P.dims.w & 1) != 0 ? P.sea.z : 0.0;
+		float mask = smoothstep(2.0 + relax, 2.0 + relax + 25.0, float(c.y));
+		int src = int(P.extra.z); // debug: bit mask of enabled foam sources (15 = all)
+		float inject = (2.0 * brk * float(src & 1) + bore * float((src >> 1) & 1)
+			+ 1.2 * swash * float((src >> 2) & 1) + 1.5 * min(hit, 1.0) * float((src >> 3) & 1)) * mask;
+		foam = clamp(foam + P.fx.x * inject * fdt, 0.0, 1.0);
+		// Foam particles: the same sources, as discrete bubbles that ride the flow.
+		uint seed = pcg(uint(c.x) * 1973u + uint(c.y) * 9277u + uint(P.dims.z) * 26699u);
+		// Patchy spawning (slowly drifting value noise on ~14 cm cells) so the bubbles form
+		// clumps that the flow stretches into streaks instead of an even sprinkle.
+		vec2 np = vec2(c) * (DXW / 0.14) + vec2(0.13, -0.07) * P.sea.x;
+		vec2 ni = floor(np), nf = np - ni;
+		nf = nf * nf * (3.0 - 2.0 * nf);
+		float nz = mix(mix(hash12(ni), hash12(ni + vec2(1, 0)), nf.x),
+			mix(hash12(ni + vec2(0, 1)), hash12(ni + vec2(1, 1)), nf.x), nf.y);
+		float patchy = 0.15 + 2.2 * nz * nz;
+		uint n = min(uint(inject * patchy * P.fx2.x * fdt + rand01(seed)), 24u);
+		if (n > 0u) {
+			uint base = atomicAdd(part_next[0], n);
+			for (uint k = 0u; k < n; k++) {
+				vec2 r = vec2(rand01(seed), rand01(seed));
+				float life = P.fx2.y * (0.45 + 1.1 * rand01(seed));
+				parts[(base + k) & (NPART - 1u)] = vec4((vec2(c) + r) * DXW, 0.0, life);
+			}
+		}
+		aer = clamp(max(aer, (0.8 * brk + 0.6 * bore) * mask), 0.0, 1.0);
+		stranded *= exp(-fdt / 0.15); // re-wetting sweeps stranded lace away
+	} else if (prev.r > 0.02) {
+		stranded = max(stranded, prev.r);
+	}
+	imageStore(fx_dst, c, vec4(foam, q.x, stranded, aer));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_PART
+// Foam particles, once per frame after FX: advect each live bubble with the
+// flow (midpoint step on the bilinear sim velocity + a small random walk), let bubbles
+// stranded on dry sand age on their own clock, and splat the survivors into the 1 cm
+// foam_dots image (cleared every frame). Value = remaining "size" (1 -> 0 at end of life);
+// the render shaders threshold it, so bubbles shrink and pop instead of fading.
+vec3 huv_at(vec2 p) { // p in water cell units, cell centres at i + 0.5
+	vec2 f = p - 0.5;
+	ivec2 i0 = ivec2(floor(f));
+	vec2 t = f - vec2(i0);
+	vec3 a = cell_huv(i0), b = cell_huv(i0 + ivec2(1, 0));
+	vec3 c = cell_huv(i0 + ivec2(0, 1)), d = cell_huv(i0 + ivec2(1, 1));
+	return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+
+void main() {
+	uint i = gl_GlobalInvocationID.y * 512u + gl_GlobalInvocationID.x;
+	if (i >= NPART) return;
+	vec4 p = parts[i];
+	if (p.w <= 0.0) return;
+	float fdt = P.wet2.z;
+	uint seed = pcg(i * 7919u + uint(P.dims.z) * 104729u);
+	vec3 a = huv_at(p.xy / DXW);
+	if (a.x > WET_H) {
+		vec3 m = huv_at((p.xy + a.yz * 0.5 * fdt) / DXW);
+		vec2 v = m.x > WET_H ? m.yz : a.yz;
+		vec2 jit = vec2(rand01(seed), rand01(seed)) - 0.5;
+		p.xy += v * fdt + jit * (P.fx2.w * 3.46 * sqrt(fdt));
+		p.z += fdt;
+	} else {
+		p.z += fdt * P.fx2.y / max(P.fx2.z, 0.1); // stranded: lasts ~ stranded life
+	}
+	float lo = 2.0 * DXW, hi = float(NW - 2) * DXW;
+	if (p.z >= p.w || p.x < lo || p.y < lo || p.x > hi || p.y > hi) {
+		parts[i].w = 0.0;
+		return;
+	}
+	parts[i] = p;
+	float size = 1.0 - smoothstep(0.5, 1.0, p.z / p.w);
+	ivec2 t = ivec2(p.xy / (DXW * 0.25));
+	imageStore(foam_dots, t, vec4(size));
+	if ((i & 3u) == 0u) { // a quarter of the bubbles are bigger
+		float s2 = size * 0.75;
+		imageStore(foam_dots, t + ivec2(1, 0), vec4(s2));
+		imageStore(foam_dots, t + ivec2(0, 1), vec4(s2));
+		imageStore(foam_dots, t + ivec2(1, 1), vec4(s2 * 0.8));
+	}
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Caustic map, render only, once per rendered frame (PC.pf.x = anim time).
+// A periodic ripple field on a CTILE x CTILE torus (48 waves on the integer wave-vector
+// lattice, so the tile has no seams; each wave has its own capillary-gravity speed, so the
+// pattern morphs instead of sliding) is refracted onto the bed by photon splatting at three
+// focal factors f (paraxial landing point x - f grad(eta)); light density = photons / mean.
+#define NC 512
+#define CTILE 5.12
+#define CAUS_WAVES 48
+
+#ifdef KERNEL_CAUS_H
+shared vec4 cw[CAUS_WAVES]; // k.x, k.y, slope / |k|, phase offset
+shared float com[CAUS_WAVES];
+
+void main() {
+	uint li = gl_LocalInvocationIndex;
+	if (li < uint(CAUS_WAVES)) { // wave table, same for every group (fixed seed)
+		uint sd = pcg(li * 7919u + 12345u);
+		float r = mix(PC.pf.z, PC.pf.w, rand01(sd));  // lattice radius: wavelength = CTILE / r
+		float a = rand01(sd) * 6.2831853;
+		vec2 k = round(vec2(cos(a), sin(a)) * r) * (6.2831853 / CTILE);
+		float kl = max(length(k), 1e-3);
+		float slope = PC.pf.y * mix(0.5, 1.5, rand01(sd));
+		cw[li] = vec4(k, slope / kl, rand01(sd) * 6.2831853);
+		com[li] = 0.35 * sqrt(9.81 * kl + 7.4e-5 * kl * kl * kl);
+	}
+	barrier();
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x >= NC || c.y >= NC) return;
+	vec2 x = (vec2(c) + 0.5) * (CTILE / float(NC));
+	float t = PC.pf.x;
+	vec2 g = vec2(0.0);
+	for (int i = 0; i < CAUS_WAVES; i++) {
+		vec4 w = cw[i];
+		g += w.z * w.xy * cos(dot(w.xy, x) - com[i] * t + w.w);
+	}
+	imageStore(caus_grad, c, vec4(g, 0.0, 0.0));
+}
+#endif
+
+#ifdef KERNEL_CAUS_SPLAT
+void splat(int slice, vec2 q, float w) {
+	vec2 f = q - 0.5;
+	ivec2 i0 = ivec2(floor(f));
+	vec2 t = f - vec2(i0);
+	ivec2 i1 = (i0 + 1) & (NC - 1);
+	i0 &= NC - 1;
+	uint base = uint(slice * NC * NC);
+	atomicAdd(caus_acc[base + uint(i0.y * NC + i0.x)], uint(w * (1.0 - t.x) * (1.0 - t.y) + 0.5));
+	atomicAdd(caus_acc[base + uint(i0.y * NC + i1.x)], uint(w * t.x * (1.0 - t.y) + 0.5));
+	atomicAdd(caus_acc[base + uint(i1.y * NC + i0.x)], uint(w * (1.0 - t.x) * t.y + 0.5));
+	atomicAdd(caus_acc[base + uint(i1.y * NC + i1.x)], uint(w * t.x * t.y + 0.5));
+}
+
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x >= NC || c.y >= NC) return;
+	const float FOCUS[3] = float[3](0.12, 0.27, 0.45); // m, matches terrain.gdshader caustic_light()
+	float inv_dx = float(NC) / CTILE;
+	vec2 p = vec2(c) + 0.5; // one photon per texel (the resolve's tent blur hides splat noise)
+	vec2 g = imageLoad(caus_grad, c).xy;
+	for (int k = 0; k < 3; k++) {
+		vec2 q = mod(p - FOCUS[k] * g * inv_dx, float(NC));
+		splat(k, q, 4096.0);
+	}
+}
+#endif
+
+#ifdef KERNEL_CAUS_RESOLVE
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	if (c.x >= NC || c.y >= NC) return;
+	vec3 sum = vec3(0.0);
+	for (int y = -1; y <= 1; y++) {
+		for (int x = -1; x <= 1; x++) {
+			ivec2 o = (c + ivec2(x, y)) & (NC - 1);
+			uint idx = uint(o.y * NC + o.x);
+			float w = float((2 - abs(x)) * (2 - abs(y)));
+			sum += w * vec3(float(caus_acc[idx]), float(caus_acc[uint(NC * NC) + idx]),
+				float(caus_acc[uint(2 * NC * NC) + idx]));
+		}
+	}
+	// Mean photon weight per texel = 4096; 3x3 tent weights sum to 16.
+	imageStore(caus_map, c, vec4(min(sum / (16.0 * 4096.0), vec3(6.0)), 1.0));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_PICK
+// Coarse sand height map for CPU mouse picking: picks[j * PC.pi.x + i] = max of the
+// (NS / PC.pi.x)^2 sand cells in coarse cell (i, j). Read back asynchronously.
+void main() {
+	ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+	int n = PC.pi.x;
+	if (c.x >= n || c.y >= n) return;
+	int f = NS / n;
+	float m = -1e9;
+	for (int y = 0; y < f; y++)
+		for (int x = 0; x < f; x++)
+			m = max(m, imageLoad(sand_a, c * f + ivec2(x, y)).x);
+	picks[c.y * n + c.x] = m;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_STATS
+// One thread per row (PC.pi.x = number of 16x16 groups dispatched along x):
+//   sums[j]           water volume in water row j (interior cells only), m^3
+//   sums[NW + j]      suspended sand in row j, m^3
+//   sums[2NW + j]     minimum (w - B) in row j (negative depth check)
+//   sums[3NW + j]     max speed in row j
+//   sums[4NW + j']    sand volume in interior sand row j' (relative to z = 0), m^3
+void main() {
+	int j = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16u * uint(PC.pi.x));
+	if (j < NW) {
+		float vol = 0.0, sed = 0.0, mn = 1e9, mx = 0.0;
+		for (int i = 2; i < NW - 2; i++) {
+			ivec2 c = ivec2(i, j);
+			vec4 q = imageLoad(water_src, c);
+			float b = imageLoad(bed, c).x;
+			float d = q.x - b;
+			if (j >= 2 && j < NW - 2) {
+				vol += max(d, 0.0);
+				sed += q.w;
+				mn = min(mn, d);
+				vec3 huv = cell_huv(c);
+				if (huv.x > WET_H) mx = max(mx, length(huv.yz));
+			}
+		}
+		sums[j] = vol * DXW * DXW;
+		sums[NW + j] = sed * DXW * DXW;
+		sums[2 * NW + j] = mn;
+		sums[3 * NW + j] = mx;
+	}
+	if (j >= 4 && j < NS - 4) {
+		float v = 0.0;
+		for (int i = 4; i < NS - 4; i++) v += imageLoad(sand_a, ivec2(i, j)).x;
+		sums[4 * NW + j] = v * DXS * DXS;
+	}
+}
+#endif
